@@ -1,6 +1,8 @@
 import type { SidebarOrganizer } from '../sidebar-organizer';
 
 import { CONFIG_NAME, NAMESPACE_TITLE, REPO_URL } from '@constants';
+import { saveAccountConfig, validateAccountConfig } from '@utilities/account-config';
+import { isItemsValid } from '@utilities/configs';
 import { clearSidebarOrganizerStorage } from '@utilities/configs/misc';
 import { clearBrowserCache, fileDownload, nextRender } from '@utilities/dom-utils';
 import { CoreFrontendUserData, subscribeFrontendUserData } from '@utilities/index';
@@ -56,9 +58,11 @@ export class SoProfileSection extends LitElement {
 
   public _coreUserData?: CoreFrontendUserData | null;
   private _unsubCoreData?: Promise<UnsubscribeFunc>;
+  private _accountChanged = () => this.requestUpdate();
 
   public connectedCallback() {
     super.connectedCallback();
+    this.organizer._accountListeners.add(this._accountChanged);
     if (this.organizer.hass) {
       this._getCoreData();
     }
@@ -66,6 +70,7 @@ export class SoProfileSection extends LitElement {
 
   public disconnectedCallback() {
     super.disconnectedCallback();
+    this.organizer._accountListeners.delete(this._accountChanged);
     if (this._unsubCoreData) {
       this._unsubCoreData.then((unsub) => unsub());
       this._unsubCoreData = undefined;
@@ -122,10 +127,33 @@ export class SoProfileSection extends LitElement {
         </div>
         <div class="card-content">
           The following settings are used to control the behavior of the Sidebar Organizer plugin.
+          <p>
+            Account configuration: ${this.organizer._accountConfig.status}. Account layouts are stored in Home Assistant
+            and loaded on every device after reload. Existing native sidebar preferences take priority. Group expansion
+            lasts for this session.
+          </p>
+          <ha-button
+            @click=${() => !this.organizer._accountManaged && this._publishAccountConfig()}
+            .disabled=${!this.organizer._accountLoaded ||
+            this.organizer._accountManaged ||
+            !this.organizer._pluginConfigured}
+          >
+            Use current layout on all devices
+          </ha-button>
+          <ha-button .disabled=${!this.organizer._accountLoaded} @click=${() => this._uploadAccountConfig()}
+            >Upload account configuration</ha-button
+          >
+          <ha-button
+            @click=${() => this._removeAccountConfig()}
+            .disabled=${!this.organizer._accountLoaded || !this.organizer._accountManaged}
+            >Remove account configuration</ha-button
+          >
         </div>
         <ha-md-list>
           ${ACTION_LIST.map((action) => {
-            const isDisabled = action.canDisable && !this.organizer._hasSidebarConfig;
+            const isDisabled =
+              (action.canDisable && !this.organizer._hasSidebarConfig) ||
+              (action.action === 'delete_config' && this.organizer._accountManaged);
             return html`
               ${action.action === 'delete_config' ? html`<wa-divider style="--spacing: 0;"></wa-divider>` : ''}
               <ha-md-list-item>
@@ -187,6 +215,79 @@ export class SoProfileSection extends LitElement {
         break;
     }
   };
+
+  private async _publishAccountConfig(config = this.organizer._config): Promise<void> {
+    // Migration copies the fully loaded layout; upload uses the same validation
+    // and confirmation path. Neither operation clears the legacy rollback copy.
+    if (!this.organizer._accountLoaded) return;
+    const connection = this.organizer.hass.connection;
+    const user = this.organizer.hass.user?.id;
+    try {
+      const validated = validateAccountConfig(config);
+      if (!(await isItemsValid(validated, this.organizer.hass))) {
+        throw new Error('Configuration contains invalid or duplicated panel paths.');
+      }
+      if (
+        !(await this.organizer._dialogManager._confirm(
+          'Save this layout for your signed-in account on all devices? Other accounts and native sidebar preferences are unchanged.',
+          'Save account layout',
+          'Cancel'
+        ))
+      )
+        return;
+      // Validation and confirmation can outlive the session that opened them.
+      // Never send the approved layout through a different account connection.
+      if (this.organizer.hass.connection !== connection || this.organizer.hass.user?.id !== user)
+        throw new Error('Account changed. Reload before saving.');
+      await saveAccountConfig(connection, validated);
+      this.organizer._reloadWindow();
+    } catch (error) {
+      await this.organizer._dialogManager._alert(`Account configuration was not saved: ${String(error)}`);
+    }
+  }
+
+  private _uploadAccountConfig(): void {
+    if (!this.organizer._accountLoaded) return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.yaml,.yml';
+    input.addEventListener(
+      'change',
+      async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        try {
+          await this._publishAccountConfig(validateAccountConfig(YAML.parse(await file.text())));
+        } catch (error) {
+          await this.organizer._dialogManager._alert(`Invalid account configuration: ${String(error)}`);
+        }
+      },
+      { once: true }
+    );
+    input.click();
+  }
+
+  private async _removeAccountConfig(): Promise<void> {
+    if (!this.organizer._accountLoaded) return;
+    const connection = this.organizer.hass.connection;
+    const user = this.organizer.hass.user?.id;
+    if (
+      !(await this.organizer._dialogManager._confirm(
+        'Remove the layout for your account on all devices? Each device will return to its existing local or file configuration after reload.',
+        'Remove',
+        'Cancel'
+      ))
+    )
+      return;
+    try {
+      if (this.organizer.hass.connection !== connection || this.organizer.hass.user?.id !== user)
+        throw new Error('Account changed.');
+      await saveAccountConfig(connection, null);
+      this.organizer._reloadWindow();
+    } catch {
+      await this.organizer._dialogManager._alert('Account configuration could not be removed. Reload and try again.');
+    }
+  }
   static styles = css`
     ha-card {
       margin: 0 auto var(--ha-space-4);

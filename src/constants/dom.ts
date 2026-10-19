@@ -56,6 +56,7 @@ export enum ELEMENT {
   HA_SIDEBAR = 'ha-sidebar',
   PROFILE_GENERAL = 'ha-profile-section-general',
   PROFILE_DASHBOARD = 'ha-profile-dashboard',
+  PROFILE_PREFERENCES = 'ha-profile-section-preferences',
   SO_PROFILE_SECTION = 'so-profile-section',
   CONFIG_LOVELACE_DASHBOARDS = 'ha-config-lovelace-dashboards',
   HA_PANEL_LOVELACE = 'ha-panel-lovelace',

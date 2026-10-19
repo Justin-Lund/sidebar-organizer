@@ -1,6 +1,6 @@
 import type { SoProfileSection } from '../../components/so-profile-section';
 import type { HomeAssistant } from '../../types/ha';
-import type { HaExtened, HaDrawer, PartialPanelResolver } from '@types';
+import type { HaExtened, HaDrawer } from '@types';
 
 import { ALERT_MSG, ELEMENT, SELECTOR, STORAGE } from '@constants';
 import { getPanelItems } from '@utilities/compute-panels';
@@ -101,6 +101,12 @@ export default class DialogHandler {
   };
 
   public async _addDialogUserDataClear(): Promise<void> {
+    if (this._organizer._accountManaged) {
+      await this._alert(
+        'Account configuration is enabled. Native sidebar preferences currently take priority. Manage those preferences in Home Assistant before using the account layout.'
+      );
+      return;
+    }
     console.log('%cDIALOG-HANDLER:', 'color: #4dabf7;', 'Prompting user to clear sidebar user data ...');
     const confirm = await this._confirm(ALERT_MSG.CLEAN_USER_DATA, 'Clear Data', 'Cancel');
     if (!confirm) {
@@ -143,6 +149,12 @@ export default class DialogHandler {
     console.log('%cDIALOG-HANDLER:', 'color: #4dabf7;', 'Handling edit mode attempt ...');
     const dialog = await this._waitForSidebarDialog();
     if (!dialog) return;
+
+    if (this._organizer._accountManaged) {
+      if (this._organizer._userHasSidebarSettings || this._organizer._accountConfig.status === 'unavailable') return;
+      dialog.remove();
+      return this._showConfigDialogEditor();
+    }
 
     dialog._open = false;
 
@@ -216,6 +228,14 @@ export default class DialogHandler {
     return dialog;
   }
   public _showConfigDialogEditor = async (): Promise<void> => {
+    // The existing editor writes browser storage. Route account edits through
+    // explicit YAML replacement so local auto-saves cannot silently fork the layout.
+    if (this._organizer._accountManaged) {
+      await this._alert(
+        'Account configuration is read-only here. Download it from the Organizer profile section, edit the YAML, then use Upload account configuration to replace it on all devices. Reload other devices to apply changes.'
+      );
+      return;
+    }
     const shouldLoadNewDialog = atLeastVersion(this.hass.config.version, 2026, 3);
 
     this._organizer.HaSidebar.editMode = false;
@@ -224,10 +244,11 @@ export default class DialogHandler {
     showDialogSidebarOrganizer(this.haElement, { config: this._organizer._config }, shouldLoadNewDialog);
   };
 
-  public async _injectSidebarOrganizerElement(panelResolver: PartialPanelResolver): Promise<void> {
+  public async _injectSidebarOrganizerElement(panelResolver: ParentNode): Promise<void> {
     const contentElement: HTMLElement | null | undefined =
       panelResolver.querySelector(ELEMENT.PROFILE_GENERAL)?.shadowRoot?.querySelector(SELECTOR.CONTENT) ??
-      panelResolver.querySelector(ELEMENT.PROFILE_DASHBOARD)?.shadowRoot?.querySelector(SELECTOR.CONTAINER);
+      panelResolver.querySelector(ELEMENT.PROFILE_DASHBOARD)?.shadowRoot?.querySelector(SELECTOR.CONTAINER) ??
+      panelResolver.querySelector(ELEMENT.PROFILE_PREFERENCES)?.shadowRoot?.querySelector(SELECTOR.CONTAINER);
 
     if (contentElement && !contentElement.querySelector(ELEMENT.SO_PROFILE_SECTION)) {
       const sectionElement = await this._createProfileSectionComponent();

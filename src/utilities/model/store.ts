@@ -97,6 +97,7 @@ export default class Store {
   }
 
   public _shouldUpdateConfig = async (): Promise<Boolean> => {
+    if (this._organizer._accountManaged) return false;
     let shouldReload = false;
     if (!this._panelHasChanged || !this._dashboardPanels) {
       return shouldReload;

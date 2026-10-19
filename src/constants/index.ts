@@ -17,6 +17,7 @@ export const NAME_RGX = /sidebar-organizer.js/i;
 
 export const PROFILE_GENERAL_PATH_REGEXP = /\/profile(\/general)?$/;
 export const PROFILE_DASHBOARD_PATH_REGEXP = /\/profile(\/dashboard)?$/;
+export const PROFILE_PREFERENCES_PATH_REGEXP = /\/profile\/preferences$/;
 
 export enum PATH {
   LOVELACE_DASHBOARD = '/config/lovelace/dashboards',

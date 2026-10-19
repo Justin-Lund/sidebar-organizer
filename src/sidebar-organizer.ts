@@ -12,6 +12,7 @@ import {
   NAMESPACE,
   PATH,
   PROFILE_DASHBOARD_PATH_REGEXP,
+  PROFILE_PREFERENCES_PATH_REGEXP,
   PROFILE_GENERAL_PATH_REGEXP,
   SELECTOR,
   STORAGE,
@@ -28,10 +29,11 @@ import {
   ElementsStore,
   HaTooltip,
 } from '@types';
+import { loadAccountConfig, AccountConfigResult } from '@utilities/account-config';
 import { _getDarkConfigMode, applyTheme } from '@utilities/apply-theme';
-import { compareHacsTagDiff } from '@utilities/compare-urls';
 
 import './components/so-group-divider';
+import { compareHacsTagDiff } from '@utilities/compare-urls';
 import { fetchConfig } from '@utilities/configs';
 import {
   atLeastVersion,
@@ -146,6 +148,18 @@ export class SidebarOrganizer {
   public _store!: Store;
   public _dialogManager!: DialogHandler;
   public _userHasSidebarSettings: boolean = false;
+  public _accountConfig: AccountConfigResult = { status: 'absent' };
+  public _accountLoaded = false;
+  public _accountListeners = new Set<() => void>();
+  private _startupGeneration = 0;
+  private _startupConnection?: HaExtened['hass']['connection'];
+  private _startupUser?: string;
+
+  get _accountManaged(): boolean {
+    // Unavailable is deliberately managed too: legacy writers must stay disabled
+    // until we know that the authenticated account has explicitly opted out.
+    return this._accountConfig.status !== 'absent';
+  }
 
   private collapsedItems = new Set<string>();
   private firstSetUpDone = false;
@@ -181,6 +195,7 @@ export class SidebarOrganizer {
   }
 
   get _hasSidebarConfig(): boolean {
+    if (this._accountManaged) return this._accountConfig.status === 'ready';
     const sidebarConfig = localStorage.getItem(STORAGE.UI_CONFIG);
     const useConfigFile = sidebarUseConfigFile();
     return useConfigFile || (sidebarConfig !== null && sidebarConfig !== undefined);
@@ -190,12 +205,49 @@ export class SidebarOrganizer {
     return Boolean(this._hasSidebarConfig && !this._userHasSidebarSettings);
   }
 
+  private _startupReady(): boolean {
+    const hass = this._ha?.hass;
+    return Boolean(hass?.connection && hass.user?.id && hass.config?.state === HA_STATE.RUNNING && hass.config.version);
+  }
+
   public async run(): Promise<void> {
-    if (!this.hass || this.hass.config?.state !== HA_STATE.RUNNING) {
-      this._store._haNotRunningToast();
+    const generation = ++this._startupGeneration;
+    // Mobile shells can render before authentication and hass initialization finish.
+    // Do not bind a partial identity or treat missing credentials as a failed read.
+    // Bound the wait so a broken startup leaves native navigation usable; another
+    // run invalidates this waiter, and a timeout asks the user to retry by reload.
+    if (!this._startupReady()) {
+      await getPromisableResult(
+        () => generation !== this._startupGeneration || this._startupReady(),
+        Boolean,
+        { retries: 120, delay: 250, shouldReject: false }
+      );
+      if (generation !== this._startupGeneration) return;
+      if (!this._startupReady()) {
+        this._accountConfig = { status: 'unavailable' };
+        this._store._showToast(
+          'Home Assistant sign-in is not ready. Reload to retry loading the account sidebar.',
+          15000
+        );
+        return;
+      }
+    }
+    const connection = this.hass?.connection;
+    const user = this.hass?.user?.id;
+    if (this._startupConnection && (this._startupConnection !== connection || this._startupUser !== user)) {
+      // New identities need HA's pristine DOM, not the previous account layout.
+      window.location.reload();
       return;
     }
-
+    this._startupConnection = connection;
+    this._startupUser = user;
+    // These helpers may have been constructed with hass before authentication.
+    this._store.hass = this.hass;
+    this._dialogManager.hass = this.hass;
+    // Check after every async boundary before applying data or changing the DOM:
+    // a newer run or identity must never inherit an earlier request's result.
+    const current = () =>
+      generation === this._startupGeneration && this.hass.connection === connection && this.hass.user?.id === user;
     if (!atLeastVersion(this.hass.config.version, 2026, 6)) {
       this._notCompatible = true;
       const msg = `${ALERT_MSG.NOT_COMPATIBLE}: ${this.hass.config.version}.\nPlease upgrade Home Assistant to 2026.6 or later.`;
@@ -206,17 +258,56 @@ export class SidebarOrganizer {
     }
 
     compareHacsTagDiff(this._ha.hass);
-    await this._checkUserSidebarSettings();
-    await this._watchEditLegacySidebar();
+    let account: AccountConfigResult;
+    let native: { panelOrder?: string[]; hiddenPanels?: string[] } | null;
+    try {
+      [account, native] = await Promise.all([
+        loadAccountConfig(connection),
+        fetchFrontendUserData(connection, 'sidebar'),
+      ]);
+    } catch {
+      account = { status: 'unavailable' };
+      native = null;
+    }
+    if (!current()) return;
+    // Account sync is opt-in, not permission to erase native customization. Keep
+    // native order/visibility authoritative and let the user resolve conflicts.
+    this._userHasSidebarSettings = Boolean(
+      native?.panelOrder?.length || (account.status === 'ready' && native?.hiddenPanels?.length)
+    );
+    this._accountConfig = account;
+    if (this._accountConfig.status === 'ready') this._config = structuredClone(this._accountConfig.config);
+    if (this._accountConfig.status === 'unavailable') {
+      this._accountLoaded = true;
+      this._accountListeners.forEach((listener) => listener());
+      this._store._showToast(
+        'Account configuration could not be loaded. Using the native sidebar; reload to retry.',
+        10000
+      );
+      this._setupConfigBtn();
+      this._checkProfileSection();
+      return;
+    }
+    if (!(account.status === 'ready' && this._userHasSidebarSettings)) await this._watchEditLegacySidebar();
+    if (!current()) return;
 
     this._setupConfigBtn();
     if (!this._userHasSidebarSettings) {
-      await this._getConfig().then(() => {
-        this._watchScrollHideHeader();
-        this._setupInitialConfig();
-      });
+      await this._getConfig();
+      if (!current()) return;
+      this._watchScrollHideHeader();
+      this._setupInitialConfig();
       this._processSections();
+    } else if (account.status === 'ready') {
+      this._store._showToast(
+        'Account layout is saved but native sidebar preferences take priority. Reset those in the native sidebar editor, then reload.',
+        15000
+      );
     }
+    if (!current()) return;
+    this._accountLoaded = true;
+    this._accountListeners.forEach((listener) => listener());
+    this._checkProfileSection();
   }
 
   // This function is only for personal use, not mentioned in the readme as it is not a core part of the plugin.
@@ -403,11 +494,18 @@ export class SidebarOrganizer {
   }
 
   private _checkProfileSection = async (): Promise<void> => {
+    if (PROFILE_PREFERENCES_PATH_REGEXP.test(window.location.pathname) && this._dialogManager) {
+      const root = this._ha.shadowRoot?.querySelector('home-assistant-main')?.shadowRoot;
+      if (root) await this._dialogManager._injectSidebarOrganizerElement(root);
+      return;
+    }
     const panelResolver = (await this._panelResolver.element) as PartialPanelResolver;
     const pathName = panelResolver?.route?.path ?? window.location.pathname;
     if (
       pathName &&
-      (PROFILE_GENERAL_PATH_REGEXP.test(pathName) || PROFILE_DASHBOARD_PATH_REGEXP.test(pathName)) &&
+      (PROFILE_GENERAL_PATH_REGEXP.test(pathName) ||
+        PROFILE_DASHBOARD_PATH_REGEXP.test(pathName) ||
+        PROFILE_PREFERENCES_PATH_REGEXP.test(pathName)) &&
       this._dialogManager
     ) {
       // console.debug('Profile section detected, injecting sidebar organizer element');
@@ -416,11 +514,6 @@ export class SidebarOrganizer {
       return;
     }
   };
-
-  private async _checkUserSidebarSettings(): Promise<void> {
-    const userData = await fetchFrontendUserData(this.hass.connection, 'sidebar');
-    this._userHasSidebarSettings = (userData?.panelOrder && userData.panelOrder.length > 0) || false;
-  }
 
   private async _setupConfigBtn(): Promise<void> {
     const siderbarRoot = (await this._sidebar.selector.$.element) as ShadowRoot;
@@ -472,6 +565,7 @@ export class SidebarOrganizer {
   }
 
   private _storageListener(event: StorageEvent) {
+    if (this._accountManaged) return;
     if (event.key === STORAGE.COLLAPSE) {
       const collapsedItems = JSON.parse(event.newValue!);
       this.collapsedItems = new Set(collapsedItems);
@@ -520,6 +614,10 @@ export class SidebarOrganizer {
   }
 
   private async _getConfig() {
+    if (this._accountConfig.status === 'ready') {
+      this._config = structuredClone(this._accountConfig.config);
+      return;
+    }
     const config = await fetchConfig(this.hass);
     // console.log('Fetched Config:', config);
     if (!config) {
@@ -555,7 +653,9 @@ export class SidebarOrganizer {
     this._pinnedGroups = normalizePinnedGroups(pinned_groups || {});
     // Initialize collapsed groups based on config, this will be used to set initial state of groups and manage collapse/expand functionality
     const allGroups = { ...(custom_groups || {}), ...(bottom_groups || {}) };
-    this.collapsedItems = getCollapsedItems(allGroups, default_collapsed);
+    this.collapsedItems = this._accountManaged
+      ? new Set((default_collapsed || []).filter((group) => group in allGroups))
+      : getCollapsedItems(allGroups, default_collapsed);
 
     // Setup custom sidebar width
     this._addCustomWidthStyle();
@@ -1033,6 +1133,7 @@ export class SidebarOrganizer {
   };
 
   private _handleNewConfig(config: SidebarConfig, useConfigFile: boolean) {
+    if (this._accountManaged) return;
     if (useConfigFile) {
       console.log('Using Config File');
       this._reloadWindow();
@@ -1060,7 +1161,7 @@ export class SidebarOrganizer {
   }
 
   private async _handleCollapsed(collapsedItems: Set<string>) {
-    setStorage(STORAGE.COLLAPSE, [...collapsedItems]);
+    if (!this._accountManaged) setStorage(STORAGE.COLLAPSE, [...collapsedItems]);
     // Wait for the DOM to update after collapsing/expanding groups
     await nextRender();
     this._handleCollapsedChange();
@@ -1422,7 +1523,7 @@ export class SidebarOrganizer {
     } else {
       this.collapsedItems.delete(group);
     }
-    setStorage(STORAGE.COLLAPSE, [...this.collapsedItems]);
+    if (!this._accountManaged) setStorage(STORAGE.COLLAPSE, [...this.collapsedItems]);
     this._handleCollapsedChange();
   }
 
