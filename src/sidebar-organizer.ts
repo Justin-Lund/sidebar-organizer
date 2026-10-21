@@ -296,8 +296,9 @@ export class SidebarOrganizer {
       await this._getConfig();
       if (!current()) return;
       this._watchScrollHideHeader();
-      this._setupInitialConfig();
-      this._processSections();
+      await this._setupInitialConfig();
+      if (!current()) return;
+      await this._processSections();
     } else if (account.status === 'ready') {
       this._store._showToast(
         'Account layout is saved but native sidebar preferences take priority. Reset those in the native sidebar editor, then reload.',
@@ -627,7 +628,7 @@ export class SidebarOrganizer {
     this._config = config;
   }
 
-  private _setupInitialConfig() {
+  private async _setupInitialConfig(): Promise<void> {
     // info
     console.groupCollapsed('%cSIDEBAR-ORGANIZER:%c ℹ️ Setting from config...', 'color: #bada55;', 'color: #228be6; ');
 
@@ -663,11 +664,11 @@ export class SidebarOrganizer {
     this._addAdditionalStyles(color_config);
 
     // Prepare base order of panels based on current sidebar state and config
-    this._setupPanelOrder();
+    await this._setupPanelOrder();
   }
 
-  private _setupPanelOrder(): void {
-    Promise.all([
+  private _setupPanelOrder(): Promise<void> {
+    return Promise.all([
       this._sidebar.selector.$.element,
       this._sidebar.selector.$.query(SELECTOR.SIDEBAR_BEFORE_SPACER_CONTAINER).element,
     ]).then((elements) => {
@@ -707,7 +708,7 @@ export class SidebarOrganizer {
         }
       }
 
-      this._getContainerItems(beforeSpacerContainer).then((items) => {
+      return this._getContainerItems(beforeSpacerContainer).then((items) => {
         Array.from(items).forEach((item: SidebarPanelItem) => {
           if (item.hasAttribute(ATTRIBUTE.NEW_ITEM)) return; // Skip new items
 
@@ -882,8 +883,8 @@ export class SidebarOrganizer {
     });
   }
 
-  private _processSections() {
-    this._getElements().then(async (elements: ElementsStore) => {
+  private _processSections(): Promise<void> {
+    return this._getElements().then(async (elements: ElementsStore) => {
       const { custom_groups, bottom_groups, visibility_templates } = this._config;
       const { topItemsContainer, topItems, bottomItemsContainer, bottomItems } = elements;
 
@@ -988,9 +989,11 @@ export class SidebarOrganizer {
     const topItemsContainer = (await this._sidebar.selector.$.query(SELECTOR.SIDEBAR_BEFORE_SPACER_CONTAINER)
       .element) as HTMLElement;
 
-    // bottom list container is optional, may not exist if no bottom items configured
-    const bottomItemsContainer = (await this._sidebar.selector.$.query(SELECTOR.SIDEBAR_BOTTOM_LIST_CONTAINER)
-      .element) as HTMLElement | null;
+    // Panel construction has completed. An absent optional bottom section is
+    // final, not a reason to poll for several seconds before grouping top items.
+    const bottomItemsContainer = sidebarShadowRoot?.querySelector(
+      SELECTOR.SIDEBAR_BOTTOM_LIST_CONTAINER
+    ) as HTMLElement | null;
 
     const topItems = await this._getContainerItems(topItemsContainer, promisableResultOptions);
     const bottomItems = bottomItemsContainer

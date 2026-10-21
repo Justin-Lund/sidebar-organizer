@@ -12,7 +12,9 @@ const HACS_TAG_RGX = /[?&]hacstag=(\d+)/;
 
 const loadedScripts = document.scripts;
 
-const loadedUrl = await getPromisableResult<string>(
+// This diagnostic must never hold up module evaluation or sidebar startup.
+// Global modules use inline import(), so a script tag may never be created.
+const loadedUrlPromise = getPromisableResult<string>(
   () => {
     const script = Array.from(loadedScripts).find((s) => NAME_RGX.test(s.src));
     return script?.src || '';
@@ -26,6 +28,10 @@ const loadedUrl = await getPromisableResult<string>(
 );
 
 export function compareHacsTagDiff(hass: HomeAssistant): void {
+  void loadedUrlPromise.then((loadedUrl) => compareLoadedHacsTag(loadedUrl, hass));
+}
+
+function compareLoadedHacsTag(loadedUrl: string, hass: HomeAssistant): void {
   const configUrl = getConfigUrl(loadedScripts);
   if (!loadedUrl || !configUrl) {
     return;

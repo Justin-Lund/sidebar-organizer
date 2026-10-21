@@ -32,9 +32,18 @@ controls access to panels and entities.
 
 ## Validation and deployment
 
+Startup awaits panel construction before processing groups. Once construction
+finishes, an absent optional bottom section is accepted immediately instead of
+polling for a container that will never exist. HACS resource-tag diagnostics run
+in the background, including when global module loading creates no script tag.
+These fixes also apply to legacy browser/file layouts; they do not shorten the
+authenticated-readiness wait or change native preference precedence.
+
 Run `node --test tests/*.test.mjs` (Node 20+ with project dependencies installed),
 `node node_modules/typescript/bin/tsc --noEmit`, and the normal Rollup build.
 Tests use authenticated-connection fixtures, not a live HA server or mobile app.
+Startup regressions cover deferred construction, bottom sections both present
+and absent, account changes during construction, and unresolved diagnostics.
 
 Deployment requires replacing the Organizer module with the built artifact and
 loading it globally so fresh clients receive it. Keep every global frontend and

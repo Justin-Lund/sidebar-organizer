@@ -63,6 +63,162 @@ function startupHarness(overrides = {}) {
   return { ...fixture, notices, applied: () => applied, reloads: () => reloads };
 }
 
+test('startup waits for panel construction and section completion before announcing readiness', async () => {
+  const f = startupHarness({ loadAccountConfig: async () => ({ status: 'ready', config: {} }) });
+  let finishPanels, finishSections;
+  f.instance._setupInitialConfig = () => new Promise(resolve => { finishPanels = resolve; });
+  f.instance._processSections = () => new Promise(resolve => { finishSections = resolve; });
+  const running = f.instance.run();
+  while (!finishPanels) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(finishSections, undefined);
+  assert.notEqual(f.instance._accountLoaded, true);
+  finishPanels();
+  while (!finishSections) await new Promise(resolve => setImmediate(resolve));
+  assert.notEqual(f.instance._accountLoaded, true);
+  finishSections();
+  await running;
+  assert.equal(f.instance._accountLoaded, true);
+});
+
+test('a changed identity after panel construction cannot enter section processing', async () => {
+  const f = startupHarness({ loadAccountConfig: async () => ({ status: 'ready', config: {} }) });
+  let finishPanels, sections = 0;
+  f.instance._setupInitialConfig = () => new Promise(resolve => { finishPanels = resolve; });
+  f.instance._processSections = () => { sections++; };
+  const running = f.instance.run();
+  while (!finishPanels) await new Promise(resolve => setImmediate(resolve));
+  f.instance._ha.hass = { ...f.instance.hass, user: { id: 'another-account' } };
+  finishPanels();
+  await running;
+  assert.equal(sections, 0);
+  assert.notEqual(f.instance._accountLoaded, true);
+});
+
+// Small DOM fixture exercises the real construction/lookup methods. It rejects
+// an async optional-container query instead of silently simulating its timeout.
+class SidebarNode {
+  constructor(tag = 'div', panel) {
+    this.tag = tag; this.children = []; this.attrs = new Map(); this.style = {};
+    this.classList = { values: new Set(), add: (...names) => names.forEach(n => this.classList.values.add(n)) };
+    if (panel) this.href = '/' + panel;
+  }
+  appendChild(node) {
+    if (node.tag === '#fragment') { [...node.children].forEach(child => this.appendChild(child)); return node; }
+    if (node.parent) node.parent.children.splice(node.parent.children.indexOf(node), 1);
+    node.parent = this; this.children.push(node); return node;
+  }
+  prepend(node) { this.appendChild(node); this.children.unshift(this.children.pop()); }
+  insertBefore(node, next) {
+    this.appendChild(node);
+    if (next) { this.children.pop(); this.children.splice(this.children.indexOf(next), 0, node); }
+  }
+  get nextElementSibling() { return this.parent?.children[this.parent.children.indexOf(this) + 1] || null; }
+  setAttribute(name, value) { this.attrs.set(name, value); }
+  getAttribute(name) { return this.attrs.get(name) ?? null; }
+  hasAttribute(name) { return this.attrs.has(name); }
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+  querySelectorAll(selector) {
+    const nodes = this.children.flatMap(child => [child, ...child.querySelectorAll('*')]);
+    if (selector === '*') return nodes;
+    if (selector === 'item') return nodes.filter(node => node.href);
+    if (selector === 'bottom') return nodes.filter(node => node.classList.values.has('bottom-list'));
+    if (selector === 'spacer') return nodes.filter(node => node.tag === 'spacer');
+    return [];
+  }
+}
+
+function panelFixture(withBottom) {
+  const root = new SidebarNode('root');
+  const top = root.appendChild(new SidebarNode('top'));
+  root.appendChild(new SidebarNode('spacer'));
+  top.appendChild(new SidebarNode('item', 'home'));
+  top.appendChild(new SidebarNode('item', 'music'));
+  const selectors = { SIDEBAR_BEFORE_SPACER_CONTAINER: 'top', SIDEBAR_BOTTOM_LIST_CONTAINER: 'bottom', SIDEBAR_LOADER: 'loader', SPACER: 'spacer' };
+  const attributes = { DATA_PANEL: 'data-panel', NEW_ITEM: 'new', GROUP: 'group', BOTTOM: 'bottom', DEFAULT_PANEL: 'default' };
+  const types = { BOTTOM_ITEMS: 'bottom_items', BOTTOM_GRID_ITEMS: 'bottom_grid_items', UNCATEGORIZED_ITEMS: 'uncategorized_items' };
+  const f = organizerHarness({
+    HTMLElement: SidebarNode,
+    document: { createDocumentFragment: () => new SidebarNode('#fragment'), createElement: tag => new SidebarNode(tag) },
+    SELECTOR: selectors, ATTRIBUTE: attributes, ELEMENT: { HA_LIST_NAV: 'nav', ITEM: 'item' }, PANEL_TYPE: types,
+    CLASS: { BOTTOM_CONTAINER: 'bottom-container', BOTTOM_GRID_CONTAINER: 'grid', BOTTOM_LIST: 'bottom-list' },
+    getDefaultPanelUrlPath: () => 'home', parseItemValues: item => ({ panelId: item.getAttribute('data-panel') }),
+    getPromisableResult: async (read, accept) => { const result = read(); assert.ok(accept(result), 'required DOM must be ready'); return result; },
+  });
+  const instance = f.instance;
+  instance.sideBarRoot = { querySelector: selector => selector === undefined ? root : root.querySelector(selector) };
+  // _panelsList getter needs the root, while _getElements uses the raw root below.
+  selectors.PANELS_LIST = 'panels';
+  instance.sideBarRoot.querySelector = selector => selector === 'panels' ? root : root.querySelector(selector);
+  instance._config = withBottom ? { custom_groups: {}, bottom_groups: { Footer: ['music'] } } : { custom_groups: { Main: ['music'] } };
+  instance._configPanelMap = new Map(Object.entries(withBottom ? instance._config.bottom_groups : instance._config.custom_groups));
+  instance._getGroupOfPanel = panel => [...instance._configPanelMap].find(([,items]) => items.includes(panel))?.[0] || null;
+  let release;
+  instance._getContainerItems = container => container === top && !release
+    ? new Promise(resolve => { release = () => resolve(container.querySelectorAll('item')); })
+    : Promise.resolve(container.querySelectorAll('item'));
+  const selector = { element: Promise.resolve(root), query: name => {
+    assert.equal(name, 'top', 'optional bottom must never use async polling');
+    return { element: Promise.resolve(top) };
+  } };
+  instance._sidebar = { selector: { $: selector } };
+  return { ...f, root, top, release: () => release() };
+}
+
+for (const withBottom of [false, true]) {
+  test(`actual panel construction completes before lookup; bottom ${withBottom ? 'present' : 'absent'}`, async () => {
+    const f = panelFixture(withBottom);
+    let complete = false;
+    const running = f.instance._setupPanelOrder().then(() => { complete = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(complete, false, 'outer promise must include the deferred item read');
+    assert.equal(f.root.querySelector('bottom'), null);
+    f.release();
+    await running;
+    const result = await f.instance._getElements();
+    assert.equal(Boolean(result.bottomItemsContainer), withBottom);
+    assert.deepEqual(Array.from(result.topItems, item => item.href), withBottom ? ['/home'] : ['/home', '/music']);
+    assert.deepEqual(result.bottomItems ? Array.from(result.bottomItems, item => item.href) : null, withBottom ? ['/music'] : null);
+    if (withBottom) assert.equal(result.bottomItems[0].getAttribute('group'), 'Footer');
+  });
+}
+
+test('initial configuration propagates construction completion', async () => {
+  const f = organizerHarness({ normalizePinnedGroups: value => value });
+  f.instance._config = { custom_groups: { Life: ['bjj'] }, default_collapsed: ['Life'] };
+  f.instance._accountConfig = { status: 'ready', config: f.instance._config };
+  f.instance._addCustomWidthStyle = () => {};
+  f.instance._addAdditionalStyles = () => {};
+  let finish, complete = false;
+  f.instance._setupPanelOrder = () => new Promise(resolve => { finish = resolve; });
+  const pending = f.instance._setupInitialConfig().then(() => { complete = true; });
+  assert.equal(complete, false);
+  assert.deepEqual([...f.instance.collapsedItems], ['Life']);
+  finish(); await pending;
+  assert.equal(complete, true);
+});
+
+test('diagnostic script-tag lookup never blocks module evaluation and still compares when resolved', async () => {
+  const source = readFileSync(new URL('../src/utilities/compare-urls.ts', import.meta.url), 'utf8');
+  const parsed = ts.createSourceFile('compare.ts', source, ts.ScriptTarget.Latest, true);
+  const printer = ts.createPrinter();
+  const stripped = parsed.statements.filter(node => !ts.isImportDeclaration(node))
+    .map(node => printer.printNode(ts.EmitHint.Unspecified, node, parsed)).join('\n');
+  const js = ts.transpileModule(stripped, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  let resolve, comparisons = 0;
+  const context = { exports: {}, document: { scripts: [] }, console,
+    getPromisableResult: () => new Promise(done => { resolve = done; }),
+    getConfigUrl: () => { comparisons++; return null; } };
+  vm.runInNewContext(js, context);
+  assert.equal(typeof context.exports.compareHacsTagDiff, 'function');
+  assert.equal(context.exports.compareHacsTagDiff({}), undefined);
+  assert.equal(comparisons, 0);
+  resolve('');
+  await new Promise(done => setImmediate(done));
+  assert.equal(comparisons, 1);
+});
+
 test('actual startup waits for account read and ignores an older overlapping response', async () => {
   const pending = [];
   const f = startupHarness({ loadAccountConfig: () => new Promise(resolve => pending.push(resolve)) });
